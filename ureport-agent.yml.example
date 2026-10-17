@@ -1,0 +1,24 @@
+# ureport-agent configuration
+# Copy to ureport-agent.yml and fill in your values.
+
+# ── Required ──────────────────────────────────────────────────────────────────
+ureport_url: http://localhost:4100
+agent_token: PASTE_YOUR_TOKEN_HERE
+
+# Root workspace — agent stores per-lane repos here:
+#   {repo_path}/myapp__e2e/        ← cloned for myapp/e2e lane
+#   {repo_path}/myapp__regression/
+repo_path: /tmp/ureport-agent-workspace
+
+# ── Optional ──────────────────────────────────────────────────────────────────
+# Claude model for AI fix and agent delegation (default: claude-sonnet-4-6)
+# ai_model: claude-sonnet-4-6
+
+# Max minutes to wait for Claude Code CLI to finish (default: 30)
+# claude_cli_timeout_minutes: 30
+
+# ── Environment variables ──────────────────────────────────────────────────────
+# ANTHROPIC_API_KEY=sk-ant-xxx   — required for AI Fix + Agent Delegation stages
+#
+# Git must be configured with credentials that can clone the repo in each playbook.
+# All other secrets (PR API token, etc.) are configured per-playbook in the UI.

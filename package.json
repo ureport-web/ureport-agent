@@ -1,0 +1,21 @@
+{
+  "name": "ureport-agent",
+  "version": "0.2.1",
+  "description": "ureport auto-heal agent",
+  "main": "agent.js",
+  "bin": {
+    "ureport-agent": "./agent.js"
+  },
+  "scripts": {
+    "start": "node agent.js",
+    "bundle": "bash scripts/bundle.sh"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "js-yaml": "^4.1.0",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

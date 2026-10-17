@@ -1,0 +1,7 @@
+# ureport-agent configuration
+ureport_url: http://localhost:4100
+# agent_token: agt_0e52c26a8d4c5e930e5a968ab006f1d421eded7a64155917
+agent_token: agt_7e7fba9dfe9096bf25b1259f836c2eb89dd8a1d6626c82eb
+repo_path: /tmp/ureport-agent-workspace
+max_concurrent_lanes: 5
+ai_model: claude-sonnet-4-6

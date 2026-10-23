@@ -32,7 +32,8 @@ function loadConfig() {
     agent_token:                raw.agent_token.trim(),
     repo_path:                  raw.repo_path ? path.resolve(raw.repo_path.trim()) : path.resolve(process.cwd(), 'workspace'),
     ai_model:                   raw.ai_model || 'claude-sonnet-4-6',
-    claude_cli_timeout_minutes: raw.claude_cli_timeout_minutes ? Number(raw.claude_cli_timeout_minutes) : null,
+    claude_cli_timeout_minutes:  raw.claude_cli_timeout_minutes  ? Number(raw.claude_cli_timeout_minutes)  : null,
+    gemini_cli_timeout_minutes:  raw.gemini_cli_timeout_minutes  ? Number(raw.gemini_cli_timeout_minutes)  : null,
   }
 }
 
@@ -228,9 +229,10 @@ async function runGuidedPipeline(signalId, playbook, ctx, cfg) {
 
   const wd = workdir || cfg.repo_path
 
-  // Stage 1: AI Fix (with retry for claude-cli self-verification)
+  // Stage 1: AI Fix (with retry for CLI provider self-verification)
   if (pipeline.aiFix?.enabled) {
-    const maxAttempts = (pipeline.aiFix.provider === 'claude-cli' && pipeline.aiFix.maxAttempts > 1)
+    const isCliProv = pipeline.aiFix.provider === 'claude-cli' || pipeline.aiFix.provider === 'gemini-cli'
+    const maxAttempts = (isCliProv && pipeline.aiFix.maxAttempts > 1)
       ? Math.min(pipeline.aiFix.maxAttempts, 5)
       : 1
     let previousAttempt = null
@@ -239,7 +241,7 @@ async function runGuidedPipeline(signalId, playbook, ctx, cfg) {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const attemptLabel = maxAttempts > 1 ? ` (attempt ${attempt}/${maxAttempts})` : ''
-      const cliPromptForLog = pipeline.aiFix.provider === 'claude-cli'
+      const cliPromptForLog = isCliProv
         ? buildCliFixPrompt(pipeline.aiFix, ctx, wd, previousAttempt)
         : null
       sendProgress(signalId, 1, 'aiFix', 'running', `Asking AI to generate a fix${attemptLabel}...`, null)
@@ -260,8 +262,8 @@ async function runGuidedPipeline(signalId, playbook, ctx, cfg) {
         stepOutputs.aiFix = { ...aiFixOut, attempts: allAttempts }
         stepsCompleted++
 
-        // claude-cli self-reports test result
-        if (pipeline.aiFix.provider === 'claude-cli' && aiFixOut.testPassed === false) {
+        // CLI providers self-report test result
+        if (isCliProv && aiFixOut.testPassed === false) {
           if (attempt < maxAttempts) {
             console.log(`[ai-fix] attempt ${attempt} failed — resetting files and retrying`)
             sendProgress(signalId, 1, 'aiFix', 'running', `Test still failing after attempt ${attempt} — resetting and retrying...`, { ...aiFixOut, attempts: allAttempts })
@@ -296,11 +298,12 @@ async function runGuidedPipeline(signalId, playbook, ctx, cfg) {
 
   // Stage 2: Verify
   if (pipeline.verify?.enabled) {
-    if (pipeline.aiFix?.enabled && pipeline.aiFix?.provider === 'claude-cli') {
-      console.log('[verify] skipped — claude-cli self-verifies during the AI fix step')
-      const skippedOut = { skipped: true, reason: 'claude-cli self-verifies during the AI fix step' }
+    const isCliProvForVerify = pipeline.aiFix?.provider === 'claude-cli' || pipeline.aiFix?.provider === 'gemini-cli'
+    if (pipeline.aiFix?.enabled && isCliProvForVerify) {
+      console.log('[verify] skipped — CLI provider self-verifies during the AI fix step')
+      const skippedOut = { skipped: true, reason: 'CLI provider self-verifies during the AI fix step' }
       stepOutputs.verify = skippedOut
-      sendProgress(signalId, 2, 'verify', 'skipped', 'Skipped — claude-cli runs and verifies the test during the AI fix step', skippedOut)
+      sendProgress(signalId, 2, 'verify', 'skipped', 'Skipped — CLI provider runs and verifies the test during the AI fix step', skippedOut)
       stepsCompleted++
     } else {
       const rawCmd = (pipeline.verify.command || '').trim() || 'npm test'
@@ -536,53 +539,12 @@ function parseAiJsonResponse(rawText, providerName) {
 }
 
 async function callAiFix(aiFix, ctx, cfg, workdir, options = {}) {
-  const provider = aiFix.provider || 'anthropic'
+  const provider = aiFix.provider || 'claude-cli'
   const { systemPrompt, userContent } = buildAiFixPrompts(aiFix, ctx, workdir)
   let parsed
   let rawResponse = ''
 
-  if (provider === 'anthropic') {
-    const apiKey = process.env.ANTHROPIC_API_KEY
-    if (!apiKey) throw new Error('ANTHROPIC_API_KEY env var not set')
-    const Anthropic = require('@anthropic-ai/sdk')
-    const client = new Anthropic({ apiKey })
-    const model = aiFix.model || cfg.ai_model || 'claude-sonnet-4-6'
-    console.log(`[ai-fix] calling Anthropic (${model})...`)
-    const response = await client.messages.create({
-      model, max_tokens: 8192,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userContent }],
-    })
-    rawResponse = response.content.filter(b => b.type === 'text').map(b => b.text).join('').trim()
-    parsed = parseAiJsonResponse(rawResponse, 'Anthropic')
-  } else if (provider === 'openai') {
-    const apiKey = process.env.OPENAI_API_KEY
-    if (!apiKey) throw new Error('OPENAI_API_KEY env var not set')
-    const OpenAI = require('openai')
-    const client = new OpenAI({ apiKey })
-    const model = aiFix.model || 'gpt-4o'
-    console.log(`[ai-fix] calling OpenAI (${model})...`)
-    const response = await client.chat.completions.create({
-      model, max_tokens: 8192,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user',   content: userContent },
-      ],
-    })
-    rawResponse = response.choices[0]?.message?.content || ''
-    parsed = parseAiJsonResponse(rawResponse, 'OpenAI')
-  } else if (provider === 'gemini') {
-    const apiKey = process.env.GEMINI_API_KEY
-    if (!apiKey) throw new Error('GEMINI_API_KEY env var not set')
-    const { GoogleGenerativeAI } = require('@google/generative-ai')
-    const genAI = new GoogleGenerativeAI(apiKey)
-    const modelName = aiFix.model || 'gemini-2.0-flash'
-    console.log(`[ai-fix] calling Gemini (${modelName})...`)
-    const model = genAI.getGenerativeModel({ model: modelName, systemInstruction: systemPrompt })
-    const result = await model.generateContent(userContent)
-    rawResponse = result.response.text()
-    parsed = parseAiJsonResponse(rawResponse, 'Gemini')
-  } else if (provider === 'claude-cli') {
+  if (provider === 'claude-cli') {
     console.log('[ai-fix] calling Claude CLI (agent mode, cwd:', workdir, ')...')
     const cliPrompt = buildCliFixPrompt(aiFix, ctx, workdir, options.previousAttempt || null)
     const cliTimeout = (cfg.claude_cli_timeout_minutes || 30) * 60 * 1000
@@ -594,8 +556,16 @@ async function callAiFix(aiFix, ctx, cfg, workdir, options = {}) {
       rawResponse = envelope.result || rawOutput
     } catch {}
     parsed = parseAiJsonResponse(rawResponse, 'Claude CLI')
+  } else if (provider === 'gemini-cli') {
+    console.log('[ai-fix] calling Gemini CLI (agent mode, cwd:', workdir, ')...')
+    const cliPrompt = buildCliFixPrompt(aiFix, ctx, workdir, options.previousAttempt || null)
+    const cliTimeout = (cfg.gemini_cli_timeout_minutes || 30) * 60 * 1000
+    const modelArgs = aiFix.model ? ['--model', aiFix.model] : []
+    const r = await exec('gemini', ['-p', cliPrompt, '--yolo', ...modelArgs], { timeout: cliTimeout, cwd: workdir })
+    rawResponse = (r.stdout || '').trim()
+    parsed = parseAiJsonResponse(rawResponse, 'Gemini CLI')
   } else {
-    throw new Error(`Unknown AI provider: ${provider}`)
+    throw new Error(`Unknown AI provider: ${provider}. Supported: claude-cli, gemini-cli`)
   }
 
   return { parsed, rawResponse, systemPrompt, userContent }
@@ -605,11 +575,11 @@ async function stageAiFix(aiFix, ctx, cfg, workdir, options = {}) {
   const { parsed, rawResponse, systemPrompt, userContent } = await callAiFix(aiFix, ctx, cfg, workdir, options)
   const analysis    = parsed.analysis || ''
   const changes     = Array.isArray(parsed.changes) ? parsed.changes : []
-  // claude-cli self-reports verification result
+  // CLI providers self-report verification result
   const testPassed  = parsed.testPassed != null ? Boolean(parsed.testPassed) : null
   const testOutput  = parsed.testOutput  || null
 
-  const inputPrompt = (aiFix.provider || 'anthropic') === 'claude-cli'
+  const inputPrompt = (aiFix.provider === 'claude-cli' || aiFix.provider === 'gemini-cli')
     ? { prompt: buildCliFixPrompt(aiFix, ctx, workdir, options.previousAttempt || null) }
     : { system: systemPrompt, user: userContent }
   // Include raw response so UI can show it when JSON was non-trivially extracted
@@ -776,109 +746,59 @@ function buildPrBody(ctx, diffSummary, signalId, options = {}) {
 // ── Agent Delegation ───────────────────────────────────────────────────────
 
 async function runAgentDelegation(signalId, playbook, ctx, cfg) {
-  const apiKey = process.env.ANTHROPIC_API_KEY
-  if (!apiKey) return sendResult(signalId, { status: 'error', error_detail: 'ANTHROPIC_API_KEY not set', steps_completed: 0, step_outputs: {} })
+  const { lane } = ctx
+  const provider = playbook.provider || 'claude-cli'
 
-  const Anthropic = require('@anthropic-ai/sdk')
-  const client = new Anthropic({ apiKey })
-  const { test, lane } = ctx
-
+  // Delegation uses a pre-cloned workspace — no checkout step
   const laneDir = `${lane.product}__${lane.type}`
   const workdir = path.join(cfg.repo_path, laneDir)
   if (!fs.existsSync(workdir)) {
-    return sendResult(signalId, { status: 'error', error_detail: `workspace not found: ${workdir}. Enable checkout stage or clone the repo manually.`, steps_completed: 0, step_outputs: {} })
+    return sendResult(signalId, { status: 'error', error_detail: `workspace not found: ${workdir}. Clone the repo to this path first, or use guided mode with the checkout stage enabled.`, steps_completed: 0, step_outputs: {} })
   }
 
-  sendProgress(signalId, 0, 'delegation', 'running', 'Starting agent delegation...', null)
+  sendProgress(signalId, 0, 'delegation', 'running', 'Running CLI agent...', null)
 
-  const tools = [
-    { name: 'read_file',      description: 'Read a file', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } },
-    { name: 'write_file',     description: 'Write a file', input_schema: { type: 'object', properties: { file_path: { type: 'string' }, content: { type: 'string' } }, required: ['file_path', 'content'] } },
-    { name: 'list_directory', description: 'List directory', input_schema: { type: 'object', properties: { dir_path: { type: 'string' } }, required: [] } },
-    { name: 'run_command',    description: 'Run a shell command in the workspace (e.g. to run tests, install deps, etc.)', input_schema: { type: 'object', properties: { command: { type: 'string', description: 'Shell command to execute' } }, required: ['command'] } },
-    { name: 'finish',         description: 'Signal done', input_schema: { type: 'object', properties: { success: { type: 'boolean' }, summary: { type: 'string' } }, required: ['success', 'summary'] } },
-  ]
-
-  const systemPrompt = ['You are an autonomous test repair agent. Fix the failing test using the tools provided.', '', playbook.prompt || '', '', 'Use finish() when done. success=true if tests pass, false if unfixable.'].join('\n')
-  const userMsg = [`Lane: ${lane.product}/${lane.type}`, `Test: ${test.name}`, test.file ? `File: ${test.file}` : null, '', '## Error', test.error_message || '(none)', test.stack_trace ? `\n## Stack Trace\n${test.stack_trace}` : null].filter(Boolean).join('\n')
-
-  const messages = [{ role: 'user', content: userMsg }]
-  let stepsCompleted = 0
-  let testOutput = null
-  const MAX_TURNS = 20
-
-  for (let turn = 0; turn < MAX_TURNS; turn++) {
-    const response = await client.messages.create({ model: cfg.ai_model, max_tokens: 8192, system: systemPrompt, tools, messages })
-    messages.push({ role: 'assistant', content: response.content })
-
-    if (response.stop_reason === 'end_turn') break
-
-    const toolResults = []
-    let finished = false
-
-    for (const block of response.content) {
-      if (block.type !== 'tool_use') continue
-      const { name, id, input } = block
-      let toolOutput = ''
-
-      try {
-        if (name === 'read_file') {
-          const fp = path.join(workdir, input.file_path)
-          toolOutput = fs.existsSync(fp) ? fs.readFileSync(fp, 'utf8') : `File not found: ${input.file_path}`
-
-        } else if (name === 'write_file') {
-          const fp = path.join(workdir, input.file_path)
-          fs.mkdirSync(path.dirname(fp), { recursive: true })
-          fs.writeFileSync(fp, input.content, 'utf8')
-          toolOutput = `Written: ${input.file_path}`
-          stepsCompleted++
-
-        } else if (name === 'list_directory') {
-          const dp = input.dir_path ? path.join(workdir, input.dir_path) : workdir
-          toolOutput = fs.existsSync(dp) ? fs.readdirSync(dp).join('\n') : `Not found: ${input.dir_path}`
-
-        } else if (name === 'run_command') {
-          const cmd = (input.command || '').trim()
-          if (!cmd) {
-            toolOutput = 'Error: no command provided'
-          } else {
-            sendProgress(signalId, turn, 'delegation', 'running', `Running: ${cmd}`, null)
-            try {
-              const r = await exec('sh', ['-c', cmd], { cwd: workdir, timeout: 10 * 60 * 1000 })
-              testOutput = (r.stdout + r.stderr).trim()
-              toolOutput = `EXIT 0\n${testOutput}`
-            } catch (err) {
-              testOutput = err.output || err.message
-              toolOutput = `EXIT ${err.code ?? 1}\n${testOutput}`
-            }
-          }
-
-        } else if (name === 'finish') {
-          finished = true
-          sendProgress(signalId, turn, 'delegation', 'done', input.summary, null)
-
-          if (input.success) {
-            await exec('git', ['add', '-A'], { cwd: workdir }).catch(() => {})
-            let attemptedDiff = ''
-            try { const dr = await exec('git', ['diff', '--cached'], { cwd: workdir }); attemptedDiff = dr.stdout || '' } catch {}
-            return sendResult(signalId, { status: 'completed', branch: null, diff_summary: input.summary, attempted_diff: attemptedDiff || null, test_output: testOutput, agent_analysis: input.summary, steps_completed: stepsCompleted, step_outputs: {} })
-          } else {
-            return sendResult(signalId, { status: 'bug_confirmed', agent_analysis: input.summary, test_output: testOutput, steps_completed: stepsCompleted, step_outputs: {} })
-          }
-        }
-      } catch (err) {
-        toolOutput = `Error: ${err.message}`
-      }
-
-      toolResults.push({ type: 'tool_result', tool_use_id: id, content: toolOutput })
-    }
-
-    if (finished) break
-    if (toolResults.length > 0) messages.push({ role: 'user', content: toolResults })
-    else break
+  // Build an aiFix-compatible config from delegation playbook fields.
+  // Backend injects stepsBlock + outputFormatBlock into the snapshot;
+  // fall back to null (buildCliFixPrompt skips null blocks).
+  const aiFix = {
+    provider,
+    model:             playbook.model            || null,
+    instructions:      playbook.prompt           || '',
+    stepsBlock:        playbook.stepsBlock        || null,
+    outputFormatBlock: playbook.outputFormatBlock || null,
+    runHintBlock:      null,
   }
 
-  sendResult(signalId, { status: 'error', error_detail: 'Agent did not call finish() within turn limit', steps_completed: stepsCompleted, step_outputs: {} })
+  let aiFixOut
+  try {
+    aiFixOut = await stageAiFix(aiFix, ctx, cfg, workdir, {})
+  } catch (err) {
+    sendProgress(signalId, 0, 'delegation', 'failed', err.message, null)
+    return sendResult(signalId, { status: 'error', error_detail: err.message, steps_completed: 0, step_outputs: {} })
+  }
+
+  sendProgress(signalId, 0, 'delegation', 'done', `Applied ${aiFixOut.filesChanged} file change(s)`, aiFixOut)
+
+  if (aiFixOut.testPassed === false) {
+    return sendResult(signalId, {
+      status:          'test_failed',
+      agent_analysis:  aiFixOut.analysis,
+      attempted_diff:  aiFixOut.diff,
+      test_output:     aiFixOut.testOutput,
+      steps_completed: 1,
+      step_outputs:    { delegation: aiFixOut },
+    })
+  }
+
+  return sendResult(signalId, {
+    status:          'completed',
+    agent_analysis:  aiFixOut.analysis,
+    diff_summary:    aiFixOut.diffSummary,
+    test_output:     aiFixOut.testOutput,
+    steps_completed: 1,
+    step_outputs:    { delegation: aiFixOut },
+  })
 }
 
 // ── Rerun Job ──────────────────────────────────────────────────────────────

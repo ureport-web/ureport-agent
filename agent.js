@@ -6,8 +6,65 @@ const path    = require('path')
 const yaml    = require('js-yaml')
 const WebSocket = require('ws')
 const { spawn } = require('child_process')
+const crypto = require('crypto')
 
 const VERSION = require('./package.json').version
+
+// ── Security helpers ───────────────────────────────────────────────────────
+
+/**
+ * Write an entry to the audit log if configured.
+ * Each line is a JSON object: { ts, ...fields }
+ */
+function writeAuditLog(cfg, fields) {
+  if (!cfg.audit_log) return
+  try {
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...fields }) + '\n'
+    fs.appendFileSync(cfg.audit_log, line)
+  } catch (e) {
+    console.warn('[agent] audit log write failed:', e.message)
+  }
+}
+
+/**
+ * Verify HMAC-SHA256 signature on an incoming job message.
+ * Returns true if: signing_secret not configured, or signature matches.
+ * Returns false if: signing_secret configured but sig missing or wrong.
+ */
+function verifyPayloadSig(msg, signingSecret) {
+  if (!signingSecret) return true
+  const { sig, ...payload } = msg
+  if (!sig) return false
+  const expected = crypto.createHmac('sha256', signingSecret)
+    .update(JSON.stringify(payload))
+    .digest('hex')
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Check a shell command against the security allowlist.
+ * Always blocks backtick and $( command substitution.
+ * If allowed_run_prefixes configured, command must start with one of them.
+ * Returns { ok: true } or { ok: false, reason: string }.
+ */
+const COMMAND_INJECTION_RE = /`|\$\(|\x00/
+function checkCommandAllowlist(cmd, cfg) {
+  if (COMMAND_INJECTION_RE.test(cmd)) {
+    return { ok: false, reason: `command injection pattern in: ${cmd}` }
+  }
+  if (cfg.allowed_run_prefixes && cfg.allowed_run_prefixes.length > 0) {
+    const allowed = cfg.allowed_run_prefixes.some(prefix => cmd.startsWith(prefix))
+    if (!allowed) {
+      return { ok: false, reason: `command does not match any allowed prefix. Got: ${cmd}` }
+    }
+  }
+  return { ok: true }
+}
+
 
 // ── Config ─────────────────────────────────────────────────────────────────
 
@@ -34,11 +91,20 @@ function loadConfig() {
     ai_model:                   raw.ai_model || 'claude-sonnet-4-6',
     claude_cli_timeout_minutes:  raw.claude_cli_timeout_minutes  ? Number(raw.claude_cli_timeout_minutes)  : null,
     gemini_cli_timeout_minutes:  raw.gemini_cli_timeout_minutes  ? Number(raw.gemini_cli_timeout_minutes)  : null,
+    signing_secret:       raw.signing_secret       ? String(raw.signing_secret).trim()                : null,
+    allowed_run_prefixes: Array.isArray(raw.allowed_run_prefixes)
+      ? raw.allowed_run_prefixes.map(p => String(p).trim()).filter(Boolean)
+      : (raw.allowed_run_prefixes ? [String(raw.allowed_run_prefixes).trim()] : []),
+    accept_job_types: Array.isArray(raw.accept_job_types)
+      ? raw.accept_job_types
+      : ['heal', 'rerun'],
+    audit_log: raw.audit_log ? path.resolve(String(raw.audit_log).trim()) : null,
   }
 }
 
 // ── WebSocket connection ───────────────────────────────────────────────────
 
+let _cfg = null  // set at startup; used by audit log helpers
 let _ws = null
 let _reconnectTimer = null
 let _stopping = false
@@ -68,7 +134,7 @@ function connect(cfg) {
     console.log('[agent] connected')
     _currentJob = null  // reset — any mid-flight job from previous connection is orphaned
 
-    send({ type: 'hello', version: VERSION, active_lanes: [] })
+    send({ type: 'hello', version: VERSION, active_lanes: [], job_types: cfg.accept_job_types })
 
     const hb = setInterval(() => {
       if (_ws && _ws.readyState === WebSocket.OPEN) _ws.ping()
@@ -112,7 +178,18 @@ function handleMessage(msg, cfg) {
       console.log(`[agent] registered as: ${msg.agent_name}`)
       break
 
-    case 'heal_job':
+    case 'heal_job': {
+      if (!verifyPayloadSig(msg, cfg.signing_secret)) {
+        console.error(`[agent] heal_job REJECTED — invalid signature for signal=${msg.signal_id}`)
+        writeAuditLog(cfg, { event: 'job_rejected', reason: 'invalid_signature', signal_id: msg.signal_id })
+        return
+      }
+      if (!cfg.accept_job_types.includes('heal')) {
+        console.warn(`[agent] heal_job ignored — 'heal' not in accept_job_types`)
+        writeAuditLog(cfg, { event: 'job_rejected', reason: 'job_type_not_accepted', signal_id: msg.signal_id })
+        return
+      }
+      writeAuditLog(cfg, { event: 'job_received', type: 'heal_job', signal_id: msg.signal_id, mode: msg.playbook?.mode })
       if (_currentJob) {
         console.warn(`[agent] already running job ${_currentJob} — ignoring new job ${msg.signal_id}`)
         return
@@ -124,8 +201,20 @@ function handleMessage(msg, cfg) {
         sendResult(msg.signal_id, { status: 'error', error_detail: err.message, steps_completed: 0, step_outputs: {} })
       })
       break
+    }
 
-    case 'rerun_job':
+    case 'rerun_job': {
+      if (!verifyPayloadSig(msg, cfg.signing_secret)) {
+        console.error(`[agent] rerun_job REJECTED — invalid signature for signal=${msg.signal_id}`)
+        writeAuditLog(cfg, { event: 'job_rejected', reason: 'invalid_signature', signal_id: msg.signal_id })
+        return
+      }
+      if (!cfg.accept_job_types.includes('rerun')) {
+        console.warn(`[agent] rerun_job ignored — 'rerun' not in accept_job_types`)
+        writeAuditLog(cfg, { event: 'job_rejected', reason: 'job_type_not_accepted', signal_id: msg.signal_id })
+        return
+      }
+      writeAuditLog(cfg, { event: 'job_received', type: 'rerun_job', signal_id: msg.signal_id })
       if (_currentJob) {
         console.warn(`[agent] already running job ${_currentJob} — ignoring rerun job ${msg.signal_id}`)
         return
@@ -138,6 +227,7 @@ function handleMessage(msg, cfg) {
         sendRerunResult(msg.signal_id, { status: 'error', output: err.message, exit_code: -1 })
       })
       break
+    }
 
     case 'ping':
       send({ type: 'pong' })
@@ -156,11 +246,13 @@ function sendProgress(signalId, stepIndex, stepId, status, message, output) {
 
 function sendResult(signalId, outcome) {
   send({ type: 'result', signal_id: signalId, ...outcome })
+  writeAuditLog(_cfg, { event: 'job_result', type: 'heal_job', signal_id: signalId, status: outcome.status })
   _currentJob = null
 }
 
 function sendRerunResult(signalId, outcome) {
   send({ type: 'rerun_result', signal_id: signalId, ...outcome })
+  writeAuditLog(_cfg, { event: 'job_result', type: 'rerun_job', signal_id: signalId, status: outcome.status })
   _currentJob = null
 }
 
@@ -623,6 +715,12 @@ async function stageVerify(verify, ctx, cfg, workdir) {
     }
   }
 
+  const verifyCheck = checkCommandAllowlist(testCmd, cfg)
+  if (!verifyCheck.ok) {
+    console.error(`[verify] BLOCKED — ${verifyCheck.reason}`)
+    writeAuditLog(cfg, { event: 'command_blocked', stage: 'verify', reason: verifyCheck.reason, cmd: testCmd })
+    throw new Error(`Command blocked by allowlist: ${verifyCheck.reason}`)
+  }
   console.log(`[verify] running: ${testCmd}`)
   try {
     const r = await exec('sh', ['-c', testCmd], { cwd: workdir, timeout: 10 * 60 * 1000, env: { ...process.env, ...envOverrides } })
@@ -873,6 +971,13 @@ async function runRerunJob(msg, cfg) {
     .replace(/\{test\.uid\}/gi,  test.uid  || '')
 
   const timeoutMs = (timeout_minutes || 10) * 60 * 1000
+  const rerunCheck = checkCommandAllowlist(resolvedCommand, cfg)
+  if (!rerunCheck.ok) {
+    console.error(`[rerun] BLOCKED — ${rerunCheck.reason}`)
+    writeAuditLog(cfg, { event: 'command_blocked', stage: 'rerun', reason: rerunCheck.reason, cmd: resolvedCommand })
+    sendRerunResult(signal_id, { status: 'error', output: `Command blocked by allowlist: ${rerunCheck.reason}`, exit_code: -1 })
+    return
+  }
   console.log(`[rerun] running: ${resolvedCommand}`)
 
   try {
@@ -929,6 +1034,7 @@ process.on('SIGTERM', shutdown)
 // ── Main ───────────────────────────────────────────────────────────────────
 
 const cfg = loadConfig()
+_cfg = cfg
 console.log(`[agent] ureport-agent v${VERSION}`)
 console.log(`[agent] server:    ${cfg.ureport_url}`)
 console.log(`[agent] workspace: ${cfg.repo_path}`)

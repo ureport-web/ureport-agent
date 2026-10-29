@@ -26,3 +26,26 @@ repo_path: /tmp/ureport-agent-workspace
 #
 # Git must be configured with credentials that can clone the repo in each playbook.
 # All other secrets (PR API token, etc.) are configured per-playbook in the UI.
+
+# ── Security ──────────────────────────────────────────────────────────────────
+
+# Payload signing — prevents forged job payloads from a compromised UReport server.
+# Set the same value as HEAL_SIGNING_SECRET on the server. Leave blank to disable.
+# signing_secret: your-secret-here
+
+# Command allowlist — agent will BLOCK any verify/rerun command that doesn't start
+# with one of these prefixes. Leave blank to skip prefix check (injection still blocked).
+# allowed_run_prefixes:
+#   - npx playwright test
+#   - npm test
+#   - yarn test
+
+# Scope pinning — limit which job types this agent will accept.
+# Default: both heal and rerun. Set to a single type to restrict.
+# accept_job_types:
+#   - heal
+#   - rerun
+
+# Audit log — agent writes every received job and result to this file.
+# Useful for forensic review of what the agent executed.
+# audit_log: ./ureport-agent-audit.log

@@ -17,13 +17,20 @@ repo_path: /tmp/ureport-agent-workspace
 # Max minutes to wait for Gemini CLI to finish (default: 30)
 # gemini_cli_timeout_minutes: 30
 
+# Self-hosted git — Create PR works with github.com, gitlab.com and bitbucket.org out of the box.
+# Add your own GitHub Enterprise / self-managed GitLab host here (provider: github | gitlab).
+# api_url is optional: defaults to https://<host>/api/v3 (github) or https://<host>/api/v4 (gitlab).
+# git_hosts:
+#   git.mycompany.com:
+#     provider: github
+#   gitlab.mycompany.com:
+#     provider: gitlab
+#     api_url: https://gitlab.mycompany.com/api/v4
+
 # ── Environment variables ──────────────────────────────────────────────────────
 # Set whichever key your playbooks use — not needed if you don't use that provider:
 #   GEMINI_API_KEY=your-key   — required for gemini-cli provider
-#
-# claude-cli authenticates via browser OAuth (run `claude` once to log in).
-# No API key needed for claude-cli.
-#
+
 # Git must be configured with credentials that can clone the repo in each playbook.
 # All other secrets (PR API token, etc.) are configured per-playbook in the UI.
 

@@ -13,6 +13,7 @@ mkdir -p "$BUNDLE_DIR"
 
 # Copy distributable files
 cp agent.js          "$BUNDLE_DIR/"
+cp git-providers.js  "$BUNDLE_DIR/"
 cp package.json      "$BUNDLE_DIR/"
 cp package-lock.json "$BUNDLE_DIR/"
 cp ureport-agent.yml.example "$BUNDLE_DIR/"

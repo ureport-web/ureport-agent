@@ -7,6 +7,7 @@ const yaml    = require('js-yaml')
 const WebSocket = require('ws')
 const { spawn } = require('child_process')
 const crypto = require('crypto')
+const { normalizeGitHosts, resolveRemote, createPullRequest } = require('./git-providers')
 
 const VERSION = require('./package.json').version
 
@@ -84,6 +85,13 @@ function loadConfig() {
     console.error('[agent] replace PASTE_YOUR_TOKEN_HERE with a real token from /auto-heal')
     process.exit(1)
   }
+  let gitHosts
+  try {
+    gitHosts = normalizeGitHosts(raw.git_hosts)
+  } catch (err) {
+    console.error(`[agent] invalid config: ${err.message}`)
+    process.exit(1)
+  }
   return {
     ureport_url:                raw.ureport_url.trim().replace(/\/+$/, ''),
     agent_token:                raw.agent_token.trim(),
@@ -99,6 +107,7 @@ function loadConfig() {
       ? raw.accept_job_types
       : ['heal', 'rerun'],
     audit_log: raw.audit_log ? path.resolve(String(raw.audit_log).trim()) : null,
+    git_hosts: gitHosts,
   }
 }
 
@@ -736,6 +745,19 @@ async function stageCreatePr(createPr, checkout, resolvedBaseBranch, ctx, cfg, s
   const apiToken = createPr.apiToken
   if (!apiToken) throw new Error('API token not set — add it to the playbook Create PR settings')
 
+  // Resolve the git host first so an unsupported remote fails before anything is pushed
+  let remoteUrl = checkout?.remote
+  if (!remoteUrl) {
+    try {
+      const r = await exec('git', ['remote', 'get-url', 'origin'], { cwd: workdir })
+      remoteUrl = r.stdout.trim()
+    } catch { /* no origin remote; reported below */ }
+  }
+  if (!remoteUrl) {
+    throw new Error('No git remote found. Set the repo URL in the playbook\'s Checkout settings.')
+  }
+  const target = resolveRemote(remoteUrl, cfg.git_hosts)
+
   // Commit if there are changes
   const statusR = await exec('git', ['status', '--porcelain'], { cwd: workdir })
   if ((statusR.stdout || '').trim()) {
@@ -751,56 +773,20 @@ async function stageCreatePr(createPr, checkout, resolvedBaseBranch, ctx, cfg, s
 
   await exec('git', ['push', 'origin', branch], { cwd: workdir })
 
-  // Resolve remote URL
-  let remoteUrl = checkout?.remote
-  if (!remoteUrl) {
-    const r = await exec('git', ['remote', 'get-url', 'origin'], { cwd: workdir })
-    remoteUrl = r.stdout.trim()
-  }
-
-  const parsed = parseRemote(remoteUrl)
   const prBody = buildPrBody(ctx, diffSummary, signalId, { ureportUrl: cfg.ureport_url, ...options })
   const prBase = resolvedBaseBranch || createPr.baseBranch
   const rawTitle = createPr.titleTemplate || `fix: auto-heal for {test.name}`
   const prTitle = applyTestVars(rawTitle, ctx.test, null)
-  let prUrl = null
-
-  if (parsed.provider === 'github') {
-    const resp = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/pulls`, {
-      method: 'POST',
-      headers: { Authorization: `token ${apiToken}`, Accept: 'application/vnd.github.v3+json', 'Content-Type': 'application/json', 'User-Agent': 'ureport-agent' },
-      body: JSON.stringify({ title: prTitle, body: prBody, head: branch, base: prBase }),
-    })
-    const data = await resp.json()
-    if (!resp.ok) throw new Error(`GitHub API ${resp.status}: ${data.message}`)
-    prUrl = data.html_url
-  } else if (parsed.provider === 'bitbucket') {
-    const authHeader = createPr.apiUsername
-      ? `Basic ${Buffer.from(`${createPr.apiUsername}:${apiToken}`).toString('base64')}`
-      : `Bearer ${apiToken}`
-    const resp = await fetch(`https://api.bitbucket.org/2.0/repositories/${parsed.workspace}/${parsed.repo}/pullrequests`, {
-      method: 'POST',
-      headers: { Authorization: authHeader, 'Content-Type': 'application/json', 'User-Agent': 'ureport-agent' },
-      body: JSON.stringify({ title: prTitle, description: prBody, source: { branch: { name: branch } }, destination: { branch: { name: prBase } } }),
-    })
-    const data = await resp.json()
-    if (!resp.ok) throw new Error(`Bitbucket API ${resp.status}: ${data.error?.message || JSON.stringify(data)}`)
-    prUrl = data.links?.html?.href
-  } else {
-    throw new Error(`Unsupported git provider — cannot parse remote: ${remoteUrl}. Supported: github.com, bitbucket.org`)
-  }
-
-  if (!prUrl) throw new Error('PR created but no URL returned from API')
+  const prUrl = await createPullRequest(target, {
+    token: apiToken,
+    username: createPr.apiUsername,
+    title: prTitle,
+    body: prBody,
+    head: branch,
+    base: prBase,
+  })
   console.log(`[create-pr] PR created: ${prUrl}`)
   return { prUrl, branch, commitSha }
-}
-
-function parseRemote(remote) {
-  const gh = remote.match(/github\.com[/:]([\w.-]+)\/([\w.-]+?)(?:\.git)?$/)
-  if (gh) return { provider: 'github', owner: gh[1], repo: gh[2] }
-  const bb = remote.match(/bitbucket\.org[/:]([^/]+)\/([\w.-]+?)(?:\.git)?$/)
-  if (bb) return { provider: 'bitbucket', workspace: bb[1], repo: bb[2] }
-  return { provider: null }
 }
 
 function buildPrBody(ctx, diffSummary, signalId, options = {}) {

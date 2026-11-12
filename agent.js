@@ -179,6 +179,19 @@ function scheduleReconnect(cfg) {
   _reconnectTimer = setTimeout(() => { _reconnectTimer = null; connect(cfg) }, RECONNECT_DELAY_MS)
 }
 
+// Tell the server a job was refused, so its signal ends in "error" instead of staying "queued".
+// Unlike sendResult/sendRerunResult this leaves _currentJob alone: another job may be running.
+function rejectJob(msg, cfg, reason, detail) {
+  writeAuditLog(cfg, { event: 'job_rejected', reason, signal_id: msg.signal_id })
+  if (msg.type === 'rerun_job') {
+    send({ type: 'rerun_result', signal_id: msg.signal_id, status: 'error', output: detail, exit_code: -1 })
+  } else {
+    send({ type: 'result', signal_id: msg.signal_id, status: 'error', error_detail: detail, steps_completed: 0, step_outputs: {} })
+  }
+}
+
+const SIGNATURE_REJECTED_DETAIL = 'Agent rejected the job: invalid signature. Check that signing_secret in the agent config matches HEAL_SIGNING_SECRET on the server.'
+
 // ── Message handler ────────────────────────────────────────────────────────
 
 function handleMessage(msg, cfg) {
@@ -190,12 +203,12 @@ function handleMessage(msg, cfg) {
     case 'heal_job': {
       if (!verifyPayloadSig(msg, cfg.signing_secret)) {
         console.error(`[agent] heal_job REJECTED — invalid signature for signal=${msg.signal_id}`)
-        writeAuditLog(cfg, { event: 'job_rejected', reason: 'invalid_signature', signal_id: msg.signal_id })
+        rejectJob(msg, cfg, 'invalid_signature', SIGNATURE_REJECTED_DETAIL)
         return
       }
       if (!cfg.accept_job_types.includes('heal')) {
         console.warn(`[agent] heal_job ignored — 'heal' not in accept_job_types`)
-        writeAuditLog(cfg, { event: 'job_rejected', reason: 'job_type_not_accepted', signal_id: msg.signal_id })
+        rejectJob(msg, cfg, 'job_type_not_accepted', "Agent rejected the job: 'heal' is not in accept_job_types in the agent config.")
         return
       }
       writeAuditLog(cfg, { event: 'job_received', type: 'heal_job', signal_id: msg.signal_id, mode: msg.playbook?.mode })
@@ -215,12 +228,12 @@ function handleMessage(msg, cfg) {
     case 'rerun_job': {
       if (!verifyPayloadSig(msg, cfg.signing_secret)) {
         console.error(`[agent] rerun_job REJECTED — invalid signature for signal=${msg.signal_id}`)
-        writeAuditLog(cfg, { event: 'job_rejected', reason: 'invalid_signature', signal_id: msg.signal_id })
+        rejectJob(msg, cfg, 'invalid_signature', SIGNATURE_REJECTED_DETAIL)
         return
       }
       if (!cfg.accept_job_types.includes('rerun')) {
         console.warn(`[agent] rerun_job ignored — 'rerun' not in accept_job_types`)
-        writeAuditLog(cfg, { event: 'job_rejected', reason: 'job_type_not_accepted', signal_id: msg.signal_id })
+        rejectJob(msg, cfg, 'job_type_not_accepted', "Agent rejected the job: 'rerun' is not in accept_job_types in the agent config.")
         return
       }
       writeAuditLog(cfg, { event: 'job_received', type: 'rerun_job', signal_id: msg.signal_id })
@@ -310,6 +323,15 @@ async function runGuidedPipeline(signalId, playbook, ctx, cfg) {
   let diffSummary = null
   let attemptedDiff = null
   let agentAnalysis = null
+  // Flaky self-heal evidence: the test passed on this agent's own run (CLI self-verify or Verify
+  // stage) and the AI changed no files. Only then is `completed` reported with rerun_passed.
+  let testVerifiedPassed = false
+  let filesChangedTotal = 0
+  const completedOutcome = (extra) => ({
+    status: 'completed',
+    ...(testVerifiedPassed && filesChangedTotal === 0 ? { rerun_passed: true, completion_reason: 'flaky' } : {}),
+    ...extra,
+  })
   let testOutput = null
 
   // Stage 0: Checkout
@@ -358,6 +380,8 @@ async function runGuidedPipeline(signalId, playbook, ctx, cfg) {
           testOutput:   aiFixOut.testOutput,
         })
         agentAnalysis = aiFixOut.analysis
+        filesChangedTotal = aiFixOut.filesChanged || 0
+        if (isCliProv && aiFixOut.testPassed === true) testVerifiedPassed = true
         attemptedDiff = aiFixOut.diff
         diffSummary   = aiFixOut.diffSummary
         stepOutputs.aiFix = { ...aiFixOut, attempts: allAttempts }
@@ -418,6 +442,7 @@ async function runGuidedPipeline(signalId, playbook, ctx, cfg) {
           sendProgress(signalId, 2, 'verify', 'failed', 'Tests still failing after fix', out)
           return handleTestFailed(signalId, pipeline, resolvedBaseBranch, ctx, cfg, wd, { testOutput, attemptedDiff, agentAnalysis, stepsCompleted, stepOutputs })
         }
+        testVerifiedPassed = true
         sendProgress(signalId, 2, 'verify', 'done', 'Tests passed', out)
       } catch (err) {
         sendProgress(signalId, 2, 'verify', 'failed', err.message, null)
@@ -436,13 +461,17 @@ async function runGuidedPipeline(signalId, playbook, ctx, cfg) {
       sendProgress(signalId, 3, 'createPr', 'done', `PR created: ${out.prUrl}`, out)
       return sendResult(signalId, { status: 'pr_created', pr_url: out.prUrl, branch: out.branch, diff_summary: diffSummary, test_output: testOutput, steps_completed: stepsCompleted, step_outputs: stepOutputs })
     } catch (err) {
+      if (err.noChanges) {
+        sendProgress(signalId, 3, 'createPr', 'skipped', `Skipped — ${err.message}`, { skipped: true, reason: err.message })
+        return sendResult(signalId, completedOutcome({ diff_summary: diffSummary, test_output: testOutput, attempted_diff: attemptedDiff, agent_analysis: agentAnalysis, steps_completed: stepsCompleted, step_outputs: stepOutputs }))
+      }
       sendProgress(signalId, 3, 'createPr', 'failed', err.message, null)
       return sendResult(signalId, { status: 'error', error_detail: `create_pr: ${err.message}`, steps_completed: stepsCompleted, step_outputs: stepOutputs, attempted_diff: attemptedDiff, agent_analysis: agentAnalysis })
     }
   }
 
   // All enabled stages done, no createPr
-  sendResult(signalId, { status: 'completed', diff_summary: diffSummary, test_output: testOutput, attempted_diff: attemptedDiff, agent_analysis: agentAnalysis, steps_completed: stepsCompleted, step_outputs: stepOutputs })
+  sendResult(signalId, completedOutcome({ diff_summary: diffSummary, test_output: testOutput, attempted_diff: attemptedDiff, agent_analysis: agentAnalysis, steps_completed: stepsCompleted, step_outputs: stepOutputs }))
 }
 
 // ── Stage: Checkout ────────────────────────────────────────────────────────
@@ -767,6 +796,23 @@ async function stageCreatePr(createPr, checkout, resolvedBaseBranch, ctx, cfg, s
 
   const branchR = await exec('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workdir })
   const branch = branchR.stdout.trim()
+
+  // Nothing to propose: the branch has no commit beyond its base, so the host would answer
+  // "no changes" (Bitbucket 400). Happens when the AI finds nothing to fix. Skip the push.
+  const baseForCompare = resolvedBaseBranch || createPr.baseBranch
+  if (baseForCompare) {
+    try {
+      const ahead = await exec('git', ['rev-list', '--count', `origin/${baseForCompare}..HEAD`], { cwd: workdir })
+      if (parseInt(ahead.stdout.trim(), 10) === 0) {
+        const noChanges = new Error('No code changes to propose: the branch is identical to the base branch')
+        noChanges.noChanges = true
+        throw noChanges
+      }
+    } catch (err) {
+      if (err.noChanges) throw err
+      // base ref not available locally: skip the check and let the push/PR report any problem
+    }
+  }
 
   const shaR = await exec('git', ['rev-parse', 'HEAD'], { cwd: workdir })
   const commitSha = shaR.stdout.trim()

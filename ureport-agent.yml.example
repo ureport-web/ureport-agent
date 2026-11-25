@@ -8,7 +8,25 @@ agent_token: PASTE_YOUR_TOKEN_HERE
 # Root workspace — agent stores per-lane repos here:
 #   {repo_path}/myapp__e2e/        ← cloned for myapp/e2e lane
 #   {repo_path}/myapp__regression/
+# A playbook with Checkout turned off works in repo_path itself, so put the repository there.
 repo_path: /tmp/ureport-agent-workspace
+
+# ── Environment variables ──────────────────────────────────────────────────────
+# Set whichever key your playbooks use — not needed if you don't use that provider:
+#   GEMINI_API_KEY=your-key   — required for gemini-cli provider
+
+# Credentials a playbook's test needs (logins, API keys, tokens): list the variable NAMES under
+# "Required environment variables" on the playbook in the UI, and give the values here, on the agent.
+# The values never reach the UReport server, the prompt or the PR, and are masked in what the agent reports.
+#
+# Either export them in the shell that starts the agent, or put them in the ureport-agent.env file that
+# ships next to this one (empty, ready to fill in):
+env_file: ./ureport-agent.env
+#
+# See README.md for the full rules.
+
+# Git must be configured with credentials that can clone the repo in each playbook.
+# All other secrets (PR API token, etc.) are configured per-playbook in the UI.
 
 # ── Optional ──────────────────────────────────────────────────────────────────
 # Max minutes to wait for Claude CLI to finish (default: 30)
@@ -27,20 +45,13 @@ repo_path: /tmp/ureport-agent-workspace
 #     provider: gitlab
 #     api_url: https://gitlab.mycompany.com/api/v4
 
-# ── Environment variables ──────────────────────────────────────────────────────
-# Set whichever key your playbooks use — not needed if you don't use that provider:
-#   GEMINI_API_KEY=your-key   — required for gemini-cli provider
-
-# Git must be configured with credentials that can clone the repo in each playbook.
-# All other secrets (PR API token, etc.) are configured per-playbook in the UI.
-
 # ── Security ──────────────────────────────────────────────────────────────────
 
 # Payload signing — prevents forged job payloads from a compromised UReport server.
 # Set the same value as HEAL_SIGNING_SECRET on the server. Leave blank to disable.
 # signing_secret: your-secret-here
 
-# Command allowlist — agent will BLOCK any verify/rerun command that doesn't start
+# Command allowlist — agent will BLOCK any rerun command that doesn't start
 # with one of these prefixes. Leave blank to skip prefix check (injection still blocked).
 # allowed_run_prefixes:
 #   - npx playwright test

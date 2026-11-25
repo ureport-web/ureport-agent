@@ -1,1 +1,4 @@
 ureport-agent.yml
+
+# env files hold credentials
+*.env

@@ -1,6 +1,6 @@
 {
   "name": "ureport-agent",
-  "version": "0.2.10",
+  "version": "0.2.13",
   "description": "ureport auto-heal agent",
   "main": "agent.js",
   "bin": {
@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "node agent.js",
+    "test": "node --test \"test/**/*.test.js\"",
     "bundle": "bash scripts/bundle.sh"
   },
   "dependencies": {
